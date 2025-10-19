@@ -1,0 +1,24 @@
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a3-highgpu-1g # or your GPU machine
+      acceleratorType: NVIDIA_H100_80GB
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/pokemon-rl-jbro914/rl-images/showdown-rlatest
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          # Write your modified script on the fly
+          cat >/tmp/entrypoint_mod.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd /workspace/pokemon-showdown
+          node pokemon-showdown start --no-security &
+          sleep 5
+          cd /workspace/gymnasium_envrionments/scripts
+          yes | python run.py train cli --gym showdown --domain random --task max DQN
+          gsutil -m cp -r /root/cares_rl_logs gs://pokemon-rl-jbro914-rl-logs/cares_rl_logs/
+          EOF
+          chmod +x /tmp/entrypoint_mod.sh
+          exec /tmp/entrypoint_mod.sh
