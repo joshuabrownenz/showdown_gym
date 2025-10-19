@@ -69,11 +69,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self.reward_mode = reward_mode
 
         self.shaping_weights = {
-            "team_hp_adv": 0.7,  # (our_total_hp - opp_total_hp)
-            "fainted_adv": 0.3,  # (their_fainted - our_fainted)/6
             "ko_bonus": 0.2,  # bonus if we KO since last step
-            "ko_malus": -0.2,  # penalty if we get KO'd since last step
-            "step_cost": 0.0,  # set to -0.005 for mild anti-stall
+            "step_cost": -0.005,  # set to -0.005 for mild anti-stall
         }
         if shaping_weights:
             self.shaping_weights.update(shaping_weights)
@@ -130,17 +127,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
           - potential_v1:    Φ with only team HP advantage and fainted advantage; KO bonuses
           - mixed:           hp_delta + 0.5 * potential_v1
         """
-        mode = self.reward_mode.lower()
-        if mode == "hp_delta":
-            return self._r_hp_delta(battle)
-        elif mode == "terminal_only":
-            return self._r_terminal_only(battle)
-        elif mode == "potential_v1":
-            return self._r_potential(battle)
-        elif mode == "mixed":
-            return self._r_hp_delta(battle) + 0.5 * self._r_potential(battle)
-        else:
-            return self._r_hp_delta(battle)
+        return self._r_terminal_only(battle)
 
     def _r_terminal_only(self, battle: AbstractBattle) -> float:
         w = self.shaping_weights
@@ -149,85 +136,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
             reward += 1.0 if battle.won else -1.0
         reward += w.get("step_cost", 0.0)
         return reward
-
-    def _r_hp_delta(self, battle: AbstractBattle) -> float:
-        prior_battle = self._get_prior_battle(battle)
-        if prior_battle is None:
-            return 0.0
-
-        def total_hp(b: AbstractBattle, mine: bool) -> float:
-            mons = b.team.values() if mine else b.opponent_team.values()
-            return float(np.sum([m.current_hp_fraction for m in mons])) / 6.0
-
-        curr_opp = total_hp(battle, mine=False)
-        prev_opp = total_hp(prior_battle, mine=False)
-        return float(prev_opp - curr_opp)
-
-    def _r_potential(self, battle: AbstractBattle) -> float:
-        """
-        Potential-based shaping (very small Φ):
-          Φ(s) = w1*(our_hp - opp_hp) + w2*((their_fainted - our_fainted)/6), clipped to [-1,1].
-        """
-        w = self.shaping_weights
-        gamma = (
-            self.train_config.get("gamma", 0.99)
-            if hasattr(self, "train_config")
-            else 0.99
-        )
-
-        reward = 0.0
-        if battle.finished:
-            reward += 1.0 if battle.won else -1.0
-
-        phi_curr = self._potential_phi(battle, w)
-        prior_battle = self._get_prior_battle(battle)
-        if prior_battle is not None:
-            phi_prev = self._potential_phi(prior_battle, w)
-            reward += gamma * phi_curr - phi_prev
-
-            # KO bonuses since last step
-            curr_self_fainted = int(
-                np.sum([int(m.fainted) for m in battle.team.values()])
-            )
-            curr_opp_fainted = int(
-                np.sum([int(m.fainted) for m in battle.opponent_team.values()])
-            )
-            prev_self_fainted = int(
-                np.sum([int(m.fainted) for m in prior_battle.team.values()])
-            )
-            prev_opp_fainted = int(
-                np.sum([int(m.fainted) for m in prior_battle.opponent_team.values()])
-            )
-
-            if curr_opp_fainted > prev_opp_fainted:
-                reward += w["ko_bonus"]
-            if curr_self_fainted > prev_self_fainted:
-                reward += w["ko_malus"]
-
-        reward += w.get("step_cost", 0.0)
-        self._last_turn = battle.turn
-        return float(reward)
-
-    def _potential_phi(self, battle: AbstractBattle, w: Dict[str, float]) -> float:
-        our_hp = (
-            float(np.sum([m.current_hp_fraction for m in battle.team.values()])) / 6.0
-        )
-        opp_hp = (
-            float(
-                np.sum([m.current_hp_fraction for m in battle.opponent_team.values()])
-            )
-            / 6.0
-        )
-        team_hp_adv = float(np.clip(our_hp - opp_hp, -1.0, 1.0))
-
-        our_fainted = int(np.sum([int(m.fainted) for m in battle.team.values()])) / 6.0
-        opp_fainted = (
-            int(np.sum([int(m.fainted) for m in battle.opponent_team.values()])) / 6.0
-        )
-        fainted_adv = float(np.clip(opp_fainted - our_fainted, -1.0, 1.0))
-
-        phi = w["team_hp_adv"] * team_hp_adv + w["fainted_adv"] * fainted_adv
-        return float(np.clip(phi, -1.0, 1.0))
 
     # --------------------------
     # Observation / Embedding
