@@ -13,38 +13,26 @@ from poke_env.battle import AbstractBattle
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
-
-from showdown_gym.base_environment import BaseShowdownEnv
-
-
-# no change needed to imports above
 from poke_env.battle import Pokemon
 from poke_env.battle import Move
 from poke_env.battle import PokemonType
 
+from showdown_gym.base_environment import BaseShowdownEnv
+
 
 class ShowdownEnvironment(BaseShowdownEnv):
     """
-    Super-slim embedding focused on the core decision:
-      - Attack now (choose best expected-damage + priority) vs
-      - Switch (bench heuristic: hp, offensive STAB effectiveness vs opp, SR damage risk)
+    Ultra-minimal embedding (8 dims). High-level actions:
+      0 = ATTACK (env chooses best move)
+      1 = SWITCH (env chooses best switch)
 
-    Observation (27 dims):
-      [ my_hp, opp_hp, my_team_total_hp, opp_team_total_hp,           # 4
-        move1(2), move2(2), move3(2), move4(2),                       # 8
-        bench1(3), bench2(3), bench3(3), bench4(3), bench5(3) ]       # 15
+    Observation (8 dims):
+      [ my_hp, opp_hp, my_team_total_hp, opp_team_total_hp,
+        best_move_expected, any_priority_move,
+        best_switch_stab_eff_vs_opp, best_switch_sr_damage ]
     """
 
-    # ---- Simple move encoding ----
-    _MOVE_BLOCK = 2
-    _N_MOVES = 4
-
-    # ---- Bench heuristic block (hp, stab_eff_vs_opp, expected_sr_damage) ----
-    _BENCH_SLOTS = 5
-    _BENCH_BLOCK = 3
-
-    # ---- Final observation size ----
-    _OBS_SIZE = 4 + _N_MOVES * _MOVE_BLOCK + _BENCH_SLOTS * _BENCH_BLOCK  # 27
+    _OBS_SIZE = 8
 
     def __init__(
         self,
@@ -52,13 +40,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         account_name_one: str = "train_one",
         account_name_two: str = "train_two",
         team: str | None = None,
-        reward_mode: str = "hp_delta",  # dense & fast by default
-        shaping_weights: Dict[str, float] | None = None,
+        hp_bonus_weight: float = 0.25,  # small terminal bonus for our team HP remaining
     ):
-        """
-        reward_mode: "hp_delta" | "terminal_only" | "potential_v1" | "mixed"
-        shaping_weights: optional overrides for potential terms (very small set here)
-        """
         super().__init__(
             battle_format=battle_format,
             account_name_one=account_name_one,
@@ -66,25 +49,73 @@ class ShowdownEnvironment(BaseShowdownEnv):
             team=team,
         )
         self.rl_agent = account_name_one
-        self.reward_mode = reward_mode
-
-        self.shaping_weights = {
-            "ko_bonus": 0.2,  # bonus if we KO since last step
-            "step_cost": -0.005,  # set to -0.005 for mild anti-stall
-        }
-        if shaping_weights:
-            self.shaping_weights.update(shaping_weights)
-
-        self._last_turn = -1
+        self.hp_bonus_weight = float(hp_bonus_weight)
 
     # --------------------------
-    # Action space (unchanged)
+    # Action space: 2 actions
+    #   0 = ATTACK (env picks best move)
+    #   1 = SWITCH (env picks best switch)
     # --------------------------
     def _get_action_size(self) -> int | None:
-        return None  # default 26 actions
+        return 2
 
     def process_action(self, action: np.int64) -> np.int64:
-        return action
+        """
+        Maps high-level action to Showdown action id:
+          0 -> return move id (6..9) by expected-damage argmax
+          1 -> return switch id (0..5) by bench heuristic
+        Fallbacks ensure a legal action when possible.
+        """
+        a = int(action)
+        assert a in (0, 1), f"High-level action must be 0 or 1, got {a}"
+
+        battle: AbstractBattle | None = self.battle1
+        if battle is None:
+            return np.int64(-2)
+
+        moves: List[Move] = list(battle.available_moves or [])
+        switches: List[Pokemon] = list(battle.available_switches or [])
+
+        # ATTACK
+        if a == 0:
+            if moves:
+                best_idx = self._argmax_move_expected(
+                    moves, battle.active_pokemon, battle.opponent_active_pokemon
+                )
+                assert (
+                    0 <= best_idx < min(4, len(moves))
+                ), f"best move idx out of range: {best_idx}, moves={len(moves)}"
+                return np.int64(6 + int(best_idx))  # 6..9 = move ids
+            # no moves -> try to switch
+            if switches:
+                best_sw = self._argmax_switch_offense(
+                    switches, battle.opponent_active_pokemon, battle.side_conditions
+                )
+                assert (
+                    0 <= best_sw < len(switches)
+                ), f"best switch idx out of range: {best_sw}, switches={len(switches)}"
+                return np.int64(best_sw)
+            return np.int64(-2)
+
+        # SWITCH
+        if switches:
+            best_sw = self._argmax_switch_offense(
+                switches, battle.opponent_active_pokemon, battle.side_conditions
+            )
+            assert (
+                0 <= best_sw < len(switches)
+            ), f"best switch idx out of range: {best_sw}, switches={len(switches)}"
+            return np.int64(best_sw)
+        # no switches -> attack if possible
+        if moves:
+            best_idx = self._argmax_move_expected(
+                moves, battle.active_pokemon, battle.opponent_active_pokemon
+            )
+            assert (
+                0 <= best_idx < min(4, len(moves))
+            ), f"best move idx out of range: {best_idx}, moves={len(moves)}"
+            return np.int64(6 + int(best_idx))
+        return np.int64(-2)
 
     # --------------------------
     # Logging / additional info
@@ -117,48 +148,43 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return info
 
     # --------------------------
-    # Rewards (curriculum-ready)
+    # Reward: single, win-centric terminal reward
+    #   r = (1 if win else 0) + hp_bonus_weight * (our_team_total_hp / 6)
+    #   (no per-step reward)
     # --------------------------
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """
-        Reward modes:
-          - hp_delta:        sum drop in opponent total HP since prior step (dense)
-          - terminal_only:   +1 win / -1 loss (+ optional small step cost)
-          - potential_v1:    Φ with only team HP advantage and fainted advantage; KO bonuses
-          - mixed:           hp_delta + 0.5 * potential_v1
-        """
-        return self._r_terminal_only(battle)
+        if not battle.finished:
+            return 0.0
 
-    def _r_terminal_only(self, battle: AbstractBattle) -> float:
-        w = self.shaping_weights
-        reward = 0.0
-        if battle.finished:
-            reward += 1.0 if battle.won else -1.0
-        reward += w.get("step_cost", 0.0)
-        return reward
+        # Big reward for winning
+        r = 1.0 if battle.won else 0.0
+
+        # Small bonus for our team HP remaining (normalized)
+        team_hp_total = (
+            float(np.sum([m.current_hp_fraction for m in battle.team.values()])) / 6.0
+        )
+        assert np.isfinite(team_hp_total), f"team_hp_total not finite: {team_hp_total}"
+        team_hp_total = float(np.clip(team_hp_total, 0.0, 1.0))
+        r += self.hp_bonus_weight * team_hp_total
+        return float(r)
 
     # --------------------------
-    # Observation / Embedding
+    # Observation / Embedding (8 dims)
     # --------------------------
     def _observation_size(self) -> int:
-        return self._OBS_SIZE  # 27
+        return self._OBS_SIZE
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
-        27 dims total:
-          [ my_hp, opp_hp, my_team_total_hp, opp_team_total_hp,
-            move1(2), move2(2), move3(2), move4(2),
-            bench1(3), bench2(3), bench3(3), bench4(3), bench5(3) ]
+        [ my_hp, opp_hp, my_team_total_hp, opp_team_total_hp,
+          best_move_expected, any_priority_move,
+          best_switch_stab_eff_vs_opp, best_switch_sr_damage ]
         """
-        vec: List[float] = []
-
         me: Pokemon | None = battle.active_pokemon
         opp: Pokemon | None = battle.opponent_active_pokemon
 
-        # --- Core HP features ---
         my_hp = float(getattr(me, "current_hp_fraction", 0.0) or 0.0) if me else 0.0
         opp_hp = float(getattr(opp, "current_hp_fraction", 0.0) or 0.0) if opp else 0.0
-
         my_team_total = (
             float(np.sum([m.current_hp_fraction for m in battle.team.values()])) / 6.0
         )
@@ -169,104 +195,229 @@ class ShowdownEnvironment(BaseShowdownEnv):
             / 6.0
         )
 
-        vec += [my_hp, opp_hp, my_team_total, opp_team_total]
+        # Bounds & finiteness checks
+        for name, val in (
+            ("my_hp", my_hp),
+            ("opp_hp", opp_hp),
+            ("my_team_total", my_team_total),
+            ("opp_team_total", opp_team_total),
+        ):
+            assert np.isfinite(val), f"{name} not finite: {val}"
+            assert 0.0 - 1e-6 <= val <= 1.0 + 1e-6, f"{name} out of [0,1]: {val}"
 
-        # --- Per-move expected-damage blocks (pad to 4) ---
-        moves: List[Move] = list(battle.available_moves or [])[: self._N_MOVES]
-        while len(moves) < self._N_MOVES:
-            moves.append(None)
+        best_expected, any_prio = self._best_move_expected_and_priority(battle, me, opp)
+        best_offense, best_sr = self._best_bench_heuristics(battle, me, opp)
 
+        for name, val in (
+            ("best_expected", best_expected),
+            ("any_prio", any_prio),
+            ("best_offense", best_offense),
+            ("best_sr", best_sr),
+        ):
+            assert np.isfinite(val), f"{name} not finite: {val}"
+            assert -1e-6 <= val <= 1.0 + 1e-6, f"{name} out of [0,1]: {val}"
+
+        vec = np.array(
+            [
+                my_hp,
+                opp_hp,
+                my_team_total,
+                opp_team_total,
+                best_expected,
+                any_prio,
+                best_offense,
+                best_sr,
+            ],
+            dtype=np.float32,
+        )
+        assert (
+            vec.shape[0] == self._OBS_SIZE
+        ), f"embed_battle produced {vec.shape[0]} dims, expected {self._OBS_SIZE}"
+        return np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # --------------------------
+    # Micro-decision helpers
+    # --------------------------
+    def _argmax_move_expected(
+        self, moves: List[Move], me: Pokemon | None, opp: Pokemon | None
+    ) -> int:
+        best_idx = 0
+        best_val = -1.0
+        limit = min(4, len(moves))  # move ids 6..9
+        for i in range(limit):
+            m = moves[i]
+            bp = self._safe_base_power(m)  # 0..200 -> normalized inside
+            acc = self._safe_accuracy(m)  # 0..1
+            eff = self._type_effectiveness(self._safe_type(m), opp)  # 0..4
+            stab_mult = 1.5 if self._safe_stab(m) else 1.0
+            expected = (bp / 200.0) * acc * eff * stab_mult / 6.0
+            expected = float(np.clip(expected, 0.0, 1.0))
+            if expected > best_val:
+                best_val = expected
+                best_idx = i
+        assert (
+            0 <= best_idx < limit or limit == 0
+        ), f"_argmax_move_expected idx invalid: {best_idx}, limit={limit}"
+        return best_idx
+
+    def _argmax_switch_offense(
+        self,
+        switches: List[Pokemon],
+        opp: Pokemon | None,
+        side_conditions: Dict[Any, Any],
+    ) -> int:
+        assert len(switches) > 0, "_argmax_switch_offense called with empty switches"
+        sr_on_our_side = self._stealth_rock_active(side_conditions)
+        best_idx = 0
+        best_val = -1.0
+        for i, mon in enumerate(switches):
+            off = (1.5 * self._stab_eff_vs_opp(mon, opp)) / 6.0  # [0,1]
+            sr = self._expected_sr_damage(mon) if sr_on_our_side else 0.0  # [0,1]
+            hp = float(getattr(mon, "current_hp_fraction", 0.0) or 0.0)
+            off = float(np.clip(off, 0.0, 1.0))
+            sr = float(np.clip(sr, 0.0, 1.0))
+            hp = float(np.clip(hp, 0.0, 1.0))
+            val = off - 0.25 * sr + 0.05 * hp
+            if val > best_val:
+                best_val = val
+                best_idx = i
+        assert (
+            0 <= best_idx < len(switches)
+        ), f"_argmax_switch_offense idx invalid: {best_idx}, n={len(switches)}"
+        return best_idx
+
+    def _best_move_expected_and_priority(
+        self, battle: AbstractBattle, me: Pokemon | None, opp: Pokemon | None
+    ) -> Tuple[float, float]:
+        moves = list(battle.available_moves or [])
+        if not moves:
+            return 0.0, 0.0
+
+        best_expected = 0.0
+        any_prio = 0.0
         for m in moves:
-            vec += self._encode_move_block(m, me, opp)
+            bp = self._safe_base_power(m)  # 0..200
+            acc = self._safe_accuracy(m)  # 0..1
+            eff = self._type_effectiveness(self._safe_type(m), opp)  # 0..4
+            stab_mult = 1.5 if self._safe_stab(m) else 1.0
+            expected = float(
+                np.clip((bp / 200.0) * acc * eff * stab_mult / 6.0, 0.0, 1.0)
+            )
+            best_expected = max(best_expected, expected)
 
-        # --- Bench heuristics (up to 5), pad with None ---
-        bench = [mon for mon in battle.team.values() if mon is not me]
-        bench = bench[: self._BENCH_SLOTS]
-        while len(bench) < self._BENCH_SLOTS:
-            bench.append(None)
+            pr = self._safe_priority(m)  # numeric priority (can be 0)
+            if pr > 0:
+                any_prio = 1.0
+
+        return best_expected, any_prio
+
+    def _best_bench_heuristics(
+        self, battle: AbstractBattle, me: Pokemon | None, opp: Pokemon | None
+    ) -> Tuple[float, float]:
+        bench = list(battle.available_switches or [])
+        if not bench:
+            return 0.0, 0.0
 
         sr_on_our_side = self._stealth_rock_active(battle.side_conditions)
-
-        for bm in bench:
-            # hp
-            hp = float(getattr(bm, "current_hp_fraction", 0.0) or 0.0) if bm else 0.0
-
-            # offensive STAB effectiveness vs opponent (max over its two types, as if it had a STAB move of that type)
-            stab_eff = self._bench_stab_effectiveness_vs_opp(bm, opp)
-
-            # expected SR damage fraction if we switch in (0 if no SR on our side)
-            sr_dmg = self._expected_sr_damage(bm) if sr_on_our_side else 0.0
-
-            vec += [hp, stab_eff, sr_dmg]
-
-        arr = np.asarray(vec, dtype=np.float32)
-        if arr.shape[0] != self._OBS_SIZE:
-            raise ValueError(
-                f"embed_battle produced {arr.shape[0]} dims, expected {self._OBS_SIZE}"
-            )
-        return np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+        best_offense = 0.0
+        best_sr_dmg = 0.0
+        for mon in bench:
+            eff = self._stab_eff_vs_opp(mon, opp)  # 0..4
+            off_norm = float(np.clip((1.5 * eff) / 6.0, 0.0, 1.0))
+            if off_norm > best_offense:
+                best_offense = off_norm
+                best_sr_dmg = self._expected_sr_damage(mon) if sr_on_our_side else 0.0
+        return best_offense, best_sr_dmg
 
     # --------------------------
-    # Move block (2 dims): expected damage score & priority
+    # Safe accessors (avoid KeyError/None)
     # --------------------------
-    def _encode_move_block(
-        self, m: Move | None, me: Pokemon | None, opp: Pokemon | None
-    ) -> List[float]:
-        """
-        [ expected_score, priority_gt0 ]
-          expected_score = base_power_norm * accuracy * effectiveness * STAB / 6  (normalized to [0,1])
-            - base_power_norm = min(base_power, 200) / 200
-            - accuracy ∈ [0,1] (100% -> 1.0)
-            - effectiveness ∈ {0, .5, 1, 2, 4}
-            - STAB = 1.5 if STAB else 1.0
-            - divide by 6 (= 1.5 * 4) to map max case to 1.0
-        """
-        if m is None:
-            return [0.0, 0.0]
-
-        # base power norm
+    def _safe_priority(self, m: Move) -> float:
         try:
-            bp = float(max(0.0, min(200.0, getattr(m, "base_power", 0.0)))) / 200.0
+            # poke-env Move.priority may raise KeyError
+            pr = m.priority  # triggers property -> may KeyError
+            return float(pr)
         except Exception:
-            bp = 0.0
+            return 0.0
 
-        # accuracy -> [0,1]
+    def _safe_accuracy(self, m: Move) -> float:
         try:
-            acc = getattr(m, "accuracy", 1.0)
+            acc = m.accuracy  # may be None or >1.0
             if acc is None:
-                acc = 1.0
+                return 1.0
             acc = float(acc)
             if acc > 1.0:
                 acc /= 100.0
-            acc = float(np.clip(acc, 0.0, 1.0))
+            return float(np.clip(acc, 0.0, 1.0))
         except Exception:
-            acc = 1.0
+            return 1.0
 
-        # effectiveness vs current opponent
-        eff = self._type_effectiveness(getattr(m, "type", None), opp)  # 0..4
-
-        # STAB flag (poke-env usually provides m.stab)
+    def _safe_base_power(self, m: Move) -> float:
         try:
-            stab_mult = 1.5 if bool(getattr(m, "stab", False)) else 1.0
+            bp = float(getattr(m, "base_power", 0.0))
+            return float(np.clip(bp, 0.0, 200.0))
         except Exception:
-            stab_mult = 1.0
+            return 0.0
 
-        expected = bp * acc * eff * stab_mult
-        # normalize by max possible (1 * 1 * 4 * 1.5 = 6)
-        expected_norm = float(np.clip(expected / 6.0, 0.0, 1.0))
-
-        # priority flag
+    def _safe_stab(self, m: Move) -> bool:
         try:
-            pr = 1.0 if getattr(m, "priority", 0) > 0 else 0.0
+            return bool(getattr(m, "stab", False))
         except Exception:
-            pr = 0.0
+            return False
 
-        return [expected_norm, pr]
+    def _safe_type(self, m: Move) -> PokemonType | None:
+        try:
+            return getattr(m, "type", None)
+        except Exception:
+            return None
+
+    # --------------------------
+    # Small helpers
+    # --------------------------
+    def _stab_eff_vs_opp(self, mon: Pokemon | None, opp: Pokemon | None) -> float:
+        if mon is None or opp is None:
+            return 1.0
+        eff_best = 1.0
+        for t in (getattr(mon, "type_1", None), getattr(mon, "type_2", None)):
+            if t is None:
+                continue
+            eff_best = max(eff_best, self._type_effectiveness(t, opp))
+        assert np.isfinite(eff_best), f"_stab_eff_vs_opp not finite: {eff_best}"
+        return float(np.clip(eff_best, 0.0, 4.0))
+
+    def _stealth_rock_active(self, side_conditions: Dict[Any, Any]) -> bool:
+        try:
+            for k in (side_conditions or {}).keys():
+                name = str(k).upper()
+                if "STEALTHROCK" in name or "STEALTH_ROCK" in name:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _expected_sr_damage(self, mon: Pokemon | None) -> float:
+        if mon is None:
+            return 0.0
+        try:
+            mult = 1.0
+            rock = PokemonType.ROCK
+            gen = getattr(mon, "battle", None)
+            gen = getattr(gen, "gen", 9)
+            for t in (getattr(mon, "type_1", None), getattr(mon, "type_2", None)):
+                if t is None:
+                    continue
+                dm = float(rock.damage_multiplier(t, gen))
+                mult *= dm
+            dmg = float(np.clip(0.125 * mult, 0.0, 1.0))
+            assert np.isfinite(dmg), f"_expected_sr_damage not finite: {dmg}"
+            return dmg
+        except Exception:
+            return 0.0
 
     def _type_effectiveness(
         self, mtype: PokemonType | None, opp: Pokemon | None
     ) -> float:
-        """Return effectiveness multiplier (0, 0.5, 1, 2, 4) best-effort."""
+        """Return effectiveness multiplier (0, 0.5, 1, 2, 4); clamps other values to [0,4]."""
         try:
             if mtype is None or opp is None:
                 return 1.0
@@ -282,82 +433,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 mult *= dm
             if mult <= 0.0:
                 return 0.0
-            if abs(mult - 0.5) < 1e-6:
-                return 0.5
-            if abs(mult - 1.0) < 1e-6:
-                return 1.0
-            if abs(mult - 2.0) < 1e-6:
-                return 2.0
-            if abs(mult - 4.0) < 1e-6:
-                return 4.0
-            return float(np.clip(mult, 0.0, 4.0))
+            # snap near-canonical values
+            for v in (0.5, 1.0, 2.0, 4.0):
+                if abs(mult - v) < 1e-6:
+                    mult = v
+                    break
+            mult = float(np.clip(mult, 0.0, 4.0))
+            assert np.isfinite(mult), f"_type_effectiveness not finite: {mult}"
+            return mult
         except Exception:
             return 1.0
-
-    # --------------------------
-    # Bench heuristics
-    # --------------------------
-    def _bench_stab_effectiveness_vs_opp(
-        self, mon: Pokemon | None, opp: Pokemon | None
-    ) -> float:
-        """
-        Offensive heuristic: if this bench mon attacked with a STAB-type move,
-        what is the best type effectiveness vs the current opponent?
-        Returns a normalized scalar in [0,1]: (1.5 * max_eff) / 6.
-        """
-        if mon is None or opp is None:
-            return 0.0
-        types = (getattr(mon, "type_1", None), getattr(mon, "type_2", None))
-        best = 1.0
-        gen = getattr(opp, "battle", None)
-        gen = getattr(gen, "gen", 9)
-        try:
-            for t in types:
-                if t is None:
-                    continue
-                # treat as if attacking with a move of type t
-                eff = self._type_effectiveness(
-                    t, opp
-                )  # reuses same method (OK because it only multiplies)
-                best = max(best, eff)
-        except Exception:
-            best = 1.0
-        # include STAB multiplier (1.5) and normalize by 6
-        return float(np.clip((1.5 * best) / 6.0, 0.0, 1.0))
-
-    def _stealth_rock_active(self, side_conditions: Dict[Any, Any]) -> bool:
-        try:
-            for k in (side_conditions or {}).keys():
-                name = str(k).upper()
-                if "STEALTHROCK" in name or "STEALTH_ROCK" in name:
-                    return True
-        except Exception:
-            pass
-        return False
-
-    def _expected_sr_damage(self, mon: Pokemon | None) -> float:
-        """
-        Expected fraction of HP lost if Stealth Rock is up on OUR side:
-          damage = 0.125 * rock_effectiveness_vs_mon  (already ∈ [0,1] in practice)
-        """
-        if mon is None:
-            return 0.0
-        try:
-            mult = 1.0
-            t1 = getattr(mon, "type_1", None)
-            t2 = getattr(mon, "type_2", None)
-            gen = getattr(mon, "battle", None)
-            gen = getattr(gen, "gen", 9)
-            rock = PokemonType.ROCK
-            for t in (t1, t2):
-                if t is None:
-                    continue
-                dm = float(rock.damage_multiplier(t, gen))
-                mult *= dm
-            dmg = 0.125 * mult
-            return float(np.clip(dmg, 0.0, 1.0))
-        except Exception:
-            return 0.0
 
 
 ########################################
