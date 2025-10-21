@@ -227,12 +227,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self.gamma = 0.99
 
         # curriculum schedule
-        self.global_step = 200000
-        self.imitation_phase_steps = 20_000  # <- pure imitation length
-        self.imitation_w0 = 0.5  # starting weight for imitation in blended phase
-        self.imitation_decay_steps = (
-            150_000  # decay to 0 over this many steps after the phase
-        )
+        self.global_step = 0
+        self.intent_imitation_steps = 20_000
+        self.win_time_decay = 0.03
 
     # --------------------------
     # Action space: 10 actions
@@ -243,127 +240,99 @@ class ShowdownEnvironment(BaseShowdownEnv):
     def process_action(self, action: np.int64) -> np.int64:
         """
         Map high-level action (0..9) to concrete Showdown action id.
-        Also compute the expert's concrete action for this SAME state and store both.
+        Also compute and store expert's concrete action AND both intents (ATTACK vs SWITCH).
         """
         a = int(action)
         assert 0 <= a <= 9, f"Action must be in [0,9], got {a}"
 
         battle: AbstractBattle | None = self.battle1
         if battle is None:
-            self._last_agent_action, self._last_expert_action = None, None
+            self._last_agent_action = None
+            self._last_expert_action = None
+            self._last_agent_intent = None
+            self._last_expert_intent = None
             return np.int64(-2)
 
-        # Build concrete from agent's requested index:
-        #  0..5 -> switch slot
-        #  6..9 -> move slot
-        agent_concrete: int = -2
-        if 0 <= a <= 5:
-            agent_concrete = (
-                a
-                if a < len(battle.available_switches or [])
-                else (-2 if not battle.available_switches else 0)
-            )
-        else:
-            move_idx = a - 6
-            agent_concrete = (
-                (6 + move_idx)
-                if move_idx < len(battle.available_moves or [])
-                else (-2 if not battle.available_moves else 6)
-            )
+        moves = list(battle.available_moves or [])
+        switches = list(battle.available_switches or [])
 
-        # Compute expert concrete action for the same state
-        expert_concrete: int = -2
+        # Agent's requested intent from high-level action
+        agent_intent = "SWITCH" if (0 <= a <= 5) else "ATTACK"
+
+        # Agent concrete mapping with fallbacks
+        if agent_intent == "SWITCH":
+            if switches:
+                agent_concrete = a if a < len(switches) else 0
+            elif moves:
+                agent_concrete = 6  # fallback to first move
+                agent_intent = "ATTACK"
+            else:
+                agent_concrete = -2
+        else:  # ATTACK
+            move_idx = a - 6
+            if moves:
+                agent_concrete = 6 + (move_idx if move_idx < len(moves) else 0)
+            elif switches:
+                agent_concrete = 0  # fallback to first switch
+                agent_intent = "SWITCH"
+            else:
+                agent_concrete = -2
+
+        # Expert choice (reuse your expert logic)
         m_idx = _expert_best_move_idx(battle)
         if m_idx is not None:
             expert_concrete = 6 + int(m_idx)
+            expert_intent = "ATTACK"
         else:
             s_idx = _expert_best_switch_idx(battle)
             if s_idx is not None:
                 expert_concrete = int(s_idx)
+                expert_intent = "SWITCH"
             else:
                 expert_concrete = -2
+                expert_intent = "SWITCH"  # arbitrary, no-ops default to non-attack
 
-        # Save both to evaluate reward on next step
+        # Persist for reward calculation
         self._last_agent_action = agent_concrete
         self._last_expert_action = expert_concrete
+        self._last_agent_intent = agent_intent
+        self._last_expert_intent = expert_intent
 
-        # Return agent concrete to env
         return np.int64(agent_concrete)
 
-    # --------------------------
-    # Imitation reward (per step)
-    # --------------------------
-
-    def _imitation_weight(self) -> float:
-        """
-        Cosine decay from imitation_w0 -> 0 over imitation_decay_steps.
-        Only used AFTER the pure-imitation phase.
-        """
-        if self.global_step < self.imitation_phase_steps:
-            return 0.0
-        t = (self.global_step - self.imitation_phase_steps) / max(
-            1, self.imitation_decay_steps
-        )
-        t = float(np.clip(t, 0.0, 1.0))
-        # cosine 1..0 -> multiply by initial weight
-        return self.imitation_w0 * 0.5 * (1.0 + np.cos(np.pi * t))
-
-    def _phi(self, b: AbstractBattle | None) -> float:
-        if b is None:
-            return 0.0
-        our_hp = float(np.sum([m.current_hp_fraction for m in b.team.values()])) / 6.0
-        opp_hp = (
-            float(np.sum([m.current_hp_fraction for m in b.opponent_team.values()]))
-            / 6.0
-        )
-        our_f = int(np.sum([int(m.fainted) for m in b.team.values()])) / 6.0
-        opp_f = int(np.sum([int(m.fainted) for m in b.opponent_team.values()])) / 6.0
-        team_adv = float(np.clip(our_hp - opp_hp, -1.0, 1.0))
-        faint_adv = float(np.clip(opp_f - our_f, -1.0, 1.0))
-        return float(np.clip(0.7 * team_adv + 0.3 * faint_adv, -1.0, 1.0))
-
-    # --- replace your calc_reward with this ---
     def calc_reward(self, battle: AbstractBattle) -> float:
         """
-        Phase 1 (steps < imitation_phase_steps): pure imitation (dense).
-        Phase 2: blended (terminal + potential shaping + decaying imitation).
+        Phase A (steps < intent_imitation_steps): intent-only imitation
+            r = 1.0 if agent_intent == expert_intent else 0.0
+        Phase B (afterwards): speed-weighted win-only
+            r = exp(-win_time_decay * T) if win else 0.0
         """
-        # imitation match (uses last concrete actions you already store)
-        imit = 0.0
-        if self._last_agent_action is not None and self._last_expert_action is not None:
-            imit = (
-                1.0
-                if int(self._last_agent_action) == int(self._last_expert_action)
-                else 0.0
-            )
+        # ---------- Phase A: intent imitation ----------
+        if self.global_step < self.intent_imitation_steps:
+            if (
+                getattr(self, "_last_agent_intent", None) is None
+                or getattr(self, "_last_expert_intent", None) is None
+            ):
+                r = 0.0
+            else:
+                r = (
+                    1.0
+                    if (self._last_agent_intent == self._last_expert_intent)
+                    else 0.0
+                )
 
-        # terminal part (+ small HP margin)
-        terminal = 0.0
-        if battle.finished:
-            terminal = 1.0 if battle.won else 0.0
-            team_hp_total = (
-                float(np.sum([m.current_hp_fraction for m in battle.team.values()]))
-                / 6.0
-            )
-            terminal += self.hp_bonus_weight * float(np.clip(team_hp_total, 0.0, 1.0))
-
-        # potential-based shaping (safe): γΦ(s') − Φ(s), lightly clipped
-        prior = self._get_prior_battle(battle)
-        dphi = 0.0
-        if prior is not None:
-            dphi = self.gamma * self._phi(battle) - self._phi(prior)
-            dphi = float(np.clip(dphi, -0.25, 0.25))
-
-        # schedule
-        if self.global_step < self.imitation_phase_steps:
-            reward = imit  # pure imitation
+        # ---------- Phase B: speed-weighted win-only ----------
         else:
-            reward = terminal + dphi + self._imitation_weight() * imit
+            if battle.finished and battle.won:
+                # battle.turn is 1-based; treat missing/zero as 1
+                T = int(getattr(battle, "turn", 1) or 1)
+                r = float(np.exp(-float(self.win_time_decay) * float(T)))
+            else:
+                r = 0.0
 
         self.global_step += 1
-        return float(reward)
+        return float(r)
 
-    # --- optional: surface the phase & imitation weight in your logs ---
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
         if self.battle1 is not None:
@@ -380,24 +349,26 @@ class ShowdownEnvironment(BaseShowdownEnv):
             fainted_opp = int(
                 np.sum([int(m.fainted) for m in b.opponent_team.values()])
             )
+
             info[agent]["win"] = b.won
             info[agent]["team_hp"] = team_hp
             info[agent]["opp_hp"] = opp_hp
             info[agent]["fainted_self"] = fainted_self
             info[agent]["fainted_opp"] = fainted_opp
             info[agent]["phase"] = (
-                "imitation"
-                if self.global_step < self.imitation_phase_steps
-                else "blended"
+                "intent_imitation"
+                if self.global_step < self.intent_imitation_steps
+                else "win_only"
             )
-            info[agent]["imit_w"] = self._imitation_weight()
+
             if (
-                self._last_agent_action is not None
-                and self._last_expert_action is not None
+                getattr(self, "_last_agent_intent", None) is not None
+                and getattr(self, "_last_expert_intent", None) is not None
             ):
-                info[agent]["imit_match"] = int(
-                    self._last_agent_action == self._last_expert_action
+                info[agent]["intent_match"] = int(
+                    self._last_agent_intent == self._last_expert_intent
                 )
+
         return info
 
     # --------------------------
