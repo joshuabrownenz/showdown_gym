@@ -412,7 +412,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # create expert player with a random numeric suffix to avoid account name collisions
         expert_suffix = int(np.random.randint(0, 1_000_000))
         expert_account = f"expertplayer{expert_suffix}"
-        self._expert_player = SimpleHeuristicsPlayer(
+        self._expert_player = ModifiedSimpleHeuristicsPlayer(
             battle_format=battle_format,
             account_configuration=AccountConfiguration(expert_account, None),
         )
