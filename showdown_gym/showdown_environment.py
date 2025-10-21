@@ -14,6 +14,7 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
 from poke_env.battle.move import Move
+from poke_env.battle import MoveCategory
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.pokemon_type import PokemonType
 
@@ -21,139 +22,111 @@ from showdown_gym.base_environment import BaseShowdownEnv
 
 
 # A simplified version of simple heuristics player that doesn't do hazards
-# class ModifiedSimpleHeuristicsPlayer(Player):
-#     SPEED_TIER_COEFICIENT = 0.1
-#     HP_FRACTION_COEFICIENT = 0.4
-#     SWITCH_OUT_MATCHUP_THRESHOLD = -2
+class ModifiedSimpleHeuristicsPlayer(Player):
+    SPEED_TIER_COEFICIENT = 0.1
+    HP_FRACTION_COEFICIENT = 0.4
+    SWITCH_OUT_MATCHUP_THRESHOLD = -2
 
-#     def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
-#         score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
-#         score -= max(
-#             [mon.damage_multiplier(t) for t in opponent.types if t is not None]
-#         )
-#         if mon.base_stats["spe"] > opponent.base_stats["spe"]:
-#             score += self.SPEED_TIER_COEFICIENT
-#         elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
-#             score -= self.SPEED_TIER_COEFICIENT
+    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
+        score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
+        score -= max(
+            [mon.damage_multiplier(t) for t in opponent.types if t is not None]
+        )
+        if mon.base_stats["spe"] > opponent.base_stats["spe"]:
+            score += self.SPEED_TIER_COEFICIENT
+        elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
+            score -= self.SPEED_TIER_COEFICIENT
 
-#         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
-#         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
+        score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
+        score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
-#         return score
+        return score
 
-#     def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
-#         if battle.can_dynamax:
-#             # Last full HP mon
-#             if (
-#                 len([m for m in battle.team.values() if m.current_hp_fraction == 1])
-#                 == 1
-#                 and battle.active_pokemon.current_hp_fraction == 1
-#             ):
-#                 return True
-#             # Matchup advantage and full hp on full hp
-#             if (
-#                 self._estimate_matchup(
-#                     battle.active_pokemon, battle.opponent_active_pokemon
-#                 )
-#                 > 0
-#                 and battle.active_pokemon.current_hp_fraction == 1
-#                 and battle.opponent_active_pokemon.current_hp_fraction == 1
-#             ):
-#                 return True
-#             if n_remaining_mons == 1:
-#                 return True
-#         return False
+    def _should_switch_out(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        # If there is a decent switch in...
+        if [
+            m
+            for m in battle.available_switches
+            if self._estimate_matchup(m, opponent) > 0
+        ]:
+            # ...and a 'good' reason to switch out
+            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+                return True
+            if (
+                active.boosts["atk"] <= -3
+                and active.stats["atk"] >= active.stats["spa"]
+            ):
+                return True
+            if (
+                active.boosts["spa"] <= -3
+                and active.stats["atk"] <= active.stats["spa"]
+            ):
+                return True
+            if (
+                self._estimate_matchup(active, opponent)
+                < self.SWITCH_OUT_MATCHUP_THRESHOLD
+            ):
+                return True
+        return False
 
-#     def _should_switch_out(self, battle: AbstractBattle):
-#         active = battle.active_pokemon
-#         opponent = battle.opponent_active_pokemon
-#         # If there is a decent switch in...
-#         if [
-#             m
-#             for m in battle.available_switches
-#             if self._estimate_matchup(m, opponent) > 0
-#         ]:
-#             # ...and a 'good' reason to switch out
-#             if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
-#                 return True
-#             if (
-#                 active.boosts["atk"] <= -3
-#                 and active.stats["atk"] >= active.stats["spa"]
-#             ):
-#                 return True
-#             if (
-#                 active.boosts["spa"] <= -3
-#                 and active.stats["atk"] <= active.stats["spa"]
-#             ):
-#                 return True
-#             if (
-#                 self._estimate_matchup(active, opponent)
-#                 < self.SWITCH_OUT_MATCHUP_THRESHOLD
-#             ):
-#                 return True
-#         return False
+    def _stat_estimation(self, mon: Pokemon, stat: str):
+        # Stats boosts value
+        if mon.boosts[stat] > 1:
+            boost = (2 + mon.boosts[stat]) / 2
+        else:
+            boost = 2 / (2 - mon.boosts[stat])
+        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
 
-#     def _stat_estimation(self, mon: Pokemon, stat: str):
-#         # Stats boosts value
-#         if mon.boosts[stat] > 1:
-#             boost = (2 + mon.boosts[stat]) / 2
-#         else:
-#             boost = 2 / (2 - mon.boosts[stat])
-#         return ((2 * mon.base_stats[stat] + 31) + 5) * boost
+    def choose_move(self, battle: AbstractBattle):
+        # Main mons shortcuts
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
 
-#     def choose_move(self, battle: AbstractBattle):
-#         if isinstance(battle, DoubleBattle):
-#             return self.choose_random_doubles_move(battle)
+        if active is None or opponent is None:
+            return self.choose_random_move(battle)
 
-#         # Main mons shortcuts
-#         active = battle.active_pokemon
-#         opponent = battle.opponent_active_pokemon
+        # Rough estimation of damage ratio
+        physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
+            opponent, "def"
+        )
+        special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(
+            opponent, "spd"
+        )
 
-#         if active is None or opponent is None:
-#             return self.choose_random_move(battle)
+        if battle.available_moves and (
+            not self._should_switch_out(battle) or not battle.available_switches
+        ):
+            n_remaining_mons = len(
+                [m for m in battle.team.values() if m.fainted is False]
+            )
 
-#         # Rough estimation of damage ratio
-#         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
-#             opponent, "def"
-#         )
-#         special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(
-#             opponent, "spd"
-#         )
+            move = max(
+                battle.available_moves,
+                key=lambda m: m.base_power
+                * (1.5 if m.type in active.types else 1)
+                * (
+                    physical_ratio
+                    if m.category == MoveCategory.PHYSICAL
+                    else special_ratio
+                )
+                * m.accuracy
+                * m.expected_hits
+                * opponent.damage_multiplier(m),
+            )
+            return self.create_order(move)
 
-#         if battle.available_moves and (
-#             not self._should_switch_out(battle) or not battle.available_switches
-#         ):
-#             n_remaining_mons = len(
-#                 [m for m in battle.team.values() if m.fainted is False]
-#             )
+        if battle.available_switches:
+            switches: List[Pokemon] = battle.available_switches
+            return self.create_order(
+                max(
+                    switches,
+                    key=lambda s: self._estimate_matchup(s, opponent),
+                )
+            )
 
-#             move = max(
-#                 battle.available_moves,
-#                 key=lambda m: m.base_power
-#                 * (1.5 if m.type in active.types else 1)
-#                 * (
-#                     physical_ratio
-#                     if m.category == MoveCategory.PHYSICAL
-#                     else special_ratio
-#                 )
-#                 * m.accuracy
-#                 * m.expected_hits
-#                 * opponent.damage_multiplier(m),
-#             )
-#             return self.create_order(
-#                 move, dynamax=self._should_dynamax(battle, n_remaining_mons)
-#             )
-
-#         if battle.available_switches:
-#             switches: List[Pokemon] = battle.available_switches
-#             return self.create_order(
-#                 max(
-#                     switches,
-#                     key=lambda s: self._estimate_matchup(s, opponent),
-#                 )
-#             )
-
-#         return self.choose_random_move(battle)
+        return self.choose_random_move(battle)
 
 
 # =============== Safe helpers ===============
@@ -389,72 +362,36 @@ def _match_expert_action_index(
 class ShowdownEnvironment(BaseShowdownEnv):
     """
     Trains against / imitates a SimpleHeuristicsPlayer (SHP) at the action level (0..9).
-      - Action space: 10 (0..5 = switches, 6..9 = moves).
-      - Phase A: +1 if agent_action == expert_action else -1.
-      - Phase B: win-only shaping (fast wins valued higher).
 
-    Observation includes all features SHP uses:
-      * Team / battle: HPs, remaining mons, can_dynamax, full-HP flags
-      * Active mon: base stats (atk/def/spa/spd/spe), boosts (atk/def/spa/spd)
-      * Opponent: base stats (def/spd/spe)
-      * Side conditions: our/opp SR, Spikes, Web, TSpikes (+ our_any)
-      * Per-move (×4): power, STAB, eff, acc, priority>0, is_physical, expected_hits,
-                       is_entry_hazard, is_anti_hazard, is_self_boost_setup
-      * Per-switch (×5): bench_hp, bench_off_eff, bench_def_vuln, speed_gt_opp, bench_spe_base
-      * Opp typing one-hots (primary 18, secondary 19)
+    Observation includes only the information that ModifiedSimpleHeuristicsPlayer uses:
+      Core:
+        - Active & opponent HP fractions
+        - Active boosts: atk/def/spa/spd
+        - Active base stats: atk/def/spa/spd/spe
+        - Opponent base stats: def/spd/spe
+      Per-move (×4):
+        - base_power/200, STAB (0/1), effectiveness vs opp /4, accuracy (0..1),
+          priority>0 (0/1), is_physical (0/1), expected_hits/5
+      Per-switch (×5):
+        - bench_hp, bench_off_eff/4, bench_def_vuln/4, bench_faster_than_opp (0/1),
+          bench_spe_base/255
     """
 
-    # Opp typing one-hot sizes
-    _TYPE_ORDER = (
-        "NORMAL",
-        "FIRE",
-        "WATER",
-        "ELECTRIC",
-        "GRASS",
-        "ICE",
-        "FIGHTING",
-        "POISON",
-        "GROUND",
-        "FLYING",
-        "PSYCHIC",
-        "BUG",
-        "ROCK",
-        "GHOST",
-        "DRAGON",
-        "DARK",
-        "STEEL",
-        "FAIRY",
-    )
-    _N_TYPE_PRIMARY = 18
-    _N_TYPE_SECONDARY = 19  # + NONE
-
-    # Layout sizes
-    # Move block: [bp_norm, STAB, eff/4, acc, pr>0, is_phys, exp_hits/5, is_hazard, is_anti_hazard, is_self_boost_setup]
-    _MOVE_BLOCK = 10
+    # Layout sizes (STRICTLY what the heuristic uses)
+    _MOVE_BLOCK = 7
     _N_MOVES = 4  # maps to 6..9
 
-    # Switch block: [bench_hp, off_eff/4, def_vuln/4, speed_gt_opp, bench_spe_base_norm]
     _SW_BLOCK = 5
-    _N_SWITCHES = 5  # maps to 0..4 (slot 5 remains spare if you ever expose it)
+    _N_SWITCHES = 5  # maps to 0..4
 
-    # Core extras (beyond the original 4 HP totals):
-    #   my_rem, opp_rem, can_dmax, my_full_hp, opp_full_hp (5)
-    #   active boosts atk/def/spa/spd (4)
-    #   active base atk/def/spa/spd/spe (5)
-    #   opp base def/spd/spe (3)
-    #   our hazards [sr, spikes, tspikes, web, any] (5)
-    #   opp hazards [sr, spikes, tspikes, web] (4)
-    _CORE_BASE = 4
-    _CORE_EXTRA = 5 + 4 + 5 + 3 + 5 + 4
+    # Core:
+    #   my_hp, opp_hp (2)
+    #   boosts_atk/6, boosts_def/6, boosts_spa/6, boosts_spd/6 (4)
+    #   base_atk/255, base_def/255, base_spa/255, base_spd/255, base_spe/255 (5)
+    #   opp_base_def/255, opp_base_spd/255, opp_base_spe/255 (3)
+    _CORE_SIZE = 2 + 4 + 5 + 3
 
-    _OBS_SIZE = (
-        _CORE_BASE
-        + _CORE_EXTRA
-        + _N_MOVES * _MOVE_BLOCK
-        + _N_SWITCHES * _SW_BLOCK
-        + _N_TYPE_PRIMARY
-        + _N_TYPE_SECONDARY
-    )
+    _OBS_SIZE = _CORE_SIZE + _N_MOVES * _MOVE_BLOCK + _N_SWITCHES * _SW_BLOCK
 
     def __init__(
         self,
@@ -472,9 +409,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self.rl_agent = account_name_one
 
         # SHP instance for expert supervision
+        # create expert player with a random numeric suffix to avoid account name collisions
+        expert_suffix = int(np.random.randint(0, 1_000_000))
+        expert_account = f"expertplayer{expert_suffix}"
         self._expert_player = SimpleHeuristicsPlayer(
             battle_format=battle_format,
-            account_configuration=AccountConfiguration("expertplayer", None),
+            account_configuration=AccountConfiguration(expert_account, None),
         )
 
         # Minimal training state
@@ -531,51 +471,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
         Observation vector contents (sizes):
-          Core (4 + 27 = 31):
-            [ my_hp, opp_hp, my_team_hp_avg, opp_team_hp_avg,
-              my_rem/6, opp_rem/6, can_dmax, my_full_hp, opp_full_hp,           (5)
-              boosts_atk/6, boosts_def/6, boosts_spa/6, boosts_spd/6,           (4)
-              base_atk/255, base_def/255, base_spa/255, base_spd/255, base_spe/255, (5)
-              opp_base_def/255, opp_base_spd/255, opp_base_spe/255,             (3)
-              ours_[sr,spikes,tspikes,web,any], opp_[sr,spikes,tspikes,web]     (9)
-            ]
-          Moves (4 × 10 = 40):
-            each: [ bp/200, STAB, eff/4, acc, pr>0, is_phys, exp_hits/5,
-                    is_entry_hazard, is_anti_hazard, is_self_boost_setup ]
+          Core (14):
+            [ my_hp, opp_hp,
+              boosts_atk/6, boosts_def/6, boosts_spa/6, boosts_spd/6,
+              base_atk/255, base_def/255, base_spa/255, base_spd/255, base_spe/255,
+              opp_base_def/255, opp_base_spd/255, opp_base_spe/255 ]
+          Moves (4 × 7 = 28):
+            each: [ bp/200, STAB, eff/4, acc, pr>0, is_phys, exp_hits/5 ]
           Switches (5 × 5 = 25):
             each: [ bench_hp, off_eff/4, def_vuln/4, speed_gt_opp, bench_spe_base/255 ]
-          Opp typing one-hots (18 + 19 = 37)
-        Total dims = {_self._OBS_SIZE}.
+          Total dims = {_self._OBS_SIZE}.
         """
         me: Pokemon | None = battle.active_pokemon
         opp: Pokemon | None = battle.opponent_active_pokemon
 
-        # --- Core (HPs and totals) ---
+        # --- Core ---
         my_hp = float(getattr(me, "current_hp_fraction", 0.0) or 0.0) if me else 0.0
         opp_hp = float(getattr(opp, "current_hp_fraction", 0.0) or 0.0) if opp else 0.0
 
-        my_team_total = (
-            float(np.sum([m.current_hp_fraction for m in battle.team.values()])) / 6.0
-        )
-        opp_team_total = (
-            float(
-                np.sum([m.current_hp_fraction for m in battle.opponent_team.values()])
-            )
-            / 6.0
-        )
-
-        # Remaining mons (alive)
-        my_rem = float(len([m for m in battle.team.values() if not m.fainted])) / 6.0
-        opp_rem = (
-            float(len([m for m in battle.opponent_team.values() if not m.fainted]))
-            / 6.0
-        )
-
-        can_dmax = 0.0  # Always equals 0.0 in gen9ubers
-        my_full = 1.0 if (me and me.current_hp_fraction == 1) else 0.0
-        opp_full = 1.0 if (opp and opp.current_hp_fraction == 1) else 0.0
-
-        # Active boosts and base stats
         boosts_atk = _safe_boost(me, "atk") / 6.0
         boosts_def = _safe_boost(me, "def") / 6.0
         boosts_spa = _safe_boost(me, "spa") / 6.0
@@ -591,31 +504,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         opp_base_spd = _safe_base_stat(opp, "spd") / 255.0
         opp_base_spe = _safe_base_stat(opp, "spe") / 255.0
 
-        # Side conditions
-        ours_sc = getattr(battle, "side_conditions", {}) or {}
-        opp_sc = getattr(battle, "opponent_side_conditions", {}) or {}
-
-        ours_sr = _has_condition(ours_sc, "stealth")  # stealth rock
-        ours_spikes = _has_condition(ours_sc, "spikes")
-        ours_tspikes = _has_condition(ours_sc, "toxic")  # toxic spikes
-        ours_web = _has_condition(ours_sc, "web")
-        ours_any = 1.0 if (ours_sr or ours_spikes or ours_tspikes or ours_web) else 0.0
-
-        opp_sr = _has_condition(opp_sc, "stealth")
-        opp_spikes = _has_condition(opp_sc, "spikes")
-        opp_tspikes = _has_condition(opp_sc, "toxic")
-        opp_web = _has_condition(opp_sc, "web")
-
         vec: List[float] = [
             my_hp,
             opp_hp,
-            my_team_total,
-            opp_team_total,
-            my_rem,
-            opp_rem,
-            can_dmax,
-            my_full,
-            opp_full,
             boosts_atk,
             boosts_def,
             boosts_spa,
@@ -628,15 +519,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
             opp_base_def,
             opp_base_spd,
             opp_base_spe,
-            ours_sr,
-            ours_spikes,
-            ours_tspikes,
-            ours_web,
-            ours_any,
-            opp_sr,
-            opp_spikes,
-            opp_tspikes,
-            opp_web,
         ]
 
         # --- Moves (pad to exactly 4) ---
@@ -648,12 +530,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
             if m is None:
                 vec += [0.0] * self._MOVE_BLOCK
                 continue
+
             bp_norm = _safe_base_power(m) / 200.0
             acc = _safe_accuracy(m)
             pr = 1.0 if _safe_priority(m) > 0 else 0.0
             is_phys = _is_move_physical(m)
             exp_hits_norm = _safe_expected_hits(m) / 5.0
 
+            # STAB and effectiveness require only types (used by the heuristic)
             t = _safe_type(m)
             stab = 0.0
             if t is not None and me is not None:
@@ -668,22 +552,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             eff = _type_effectiveness(t, opp) if t is not None else 1.0
             eff_norm = float(np.clip(eff / 4.0, 0.0, 1.0))
 
-            is_hazard = _is_entry_hazard_move(m)
-            is_anti = _is_anti_hazard_move(m)
-            is_self_boost = _is_self_boost_setup_move(m, me)
-
-            vec += [
-                bp_norm,
-                stab,
-                eff_norm,
-                acc,
-                pr,
-                is_phys,
-                exp_hits_norm,
-                is_hazard,
-                is_anti,
-                is_self_boost,
-            ]
+            vec += [bp_norm, stab, eff_norm, acc, pr, is_phys, exp_hits_norm]
 
         # --- Switches (pad to exactly 5) ---
         bench: List[Pokemon | None] = list(battle.available_switches or [])[
@@ -692,14 +561,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
         while len(bench) < self._N_SWITCHES:
             bench.append(None)
 
-        opp_spe = _safe_base_stat(opp, "spe")
+        opp_spe_raw = _safe_base_stat(opp, "spe")
 
         for bm in bench:
             if bm is None:
                 vec += [0.0] * self._SW_BLOCK
                 continue
+
             hp = float(getattr(bm, "current_hp_fraction", 0.0) or 0.0)
-            # Offensive effectiveness (max of its types vs opp)
+
+            # Offensive effectiveness: max over bench types vs opponent (same notion SHP uses)
             types = [
                 t
                 for t in (getattr(bm, "type_1", None), getattr(bm, "type_2", None))
@@ -712,54 +583,20 @@ class ShowdownEnvironment(BaseShowdownEnv):
             )
             eff_off_norm = float(np.clip(eff_off / 4.0, 0.0, 1.0))
 
-            # Defensive vulnerability: how hard opp types hit this mon (max multiplier)
+            # Defensive vulnerability: how hard opp's types hit bench (max multiplier)
             def_vuln = _opp_damage_to_mon_max(opp, bm)
             def_vuln_norm = float(np.clip(def_vuln / 4.0, 0.0, 1.0))
 
-            spd_gt = 1.0 if _safe_base_stat(bm, "spe") > opp_spe else 0.0
+            spd_gt = 1.0 if _safe_base_stat(bm, "spe") > opp_spe_raw else 0.0
             bench_spe_norm = _safe_base_stat(bm, "spe") / 255.0
 
             vec += [hp, eff_off_norm, def_vuln_norm, spd_gt, bench_spe_norm]
-
-        # --- Opponent typing one-hots (18 + 19) ---
-        t1 = getattr(opp, "type_1", None)
-        t2 = getattr(opp, "type_2", None)
-        vec += self._type_one_hot_primary(t1)
-        vec += self._type_one_hot_secondary(t2)
 
         arr = np.asarray(vec, dtype=np.float32)
         assert (
             arr.shape[0] == self._OBS_SIZE
         ), f"embed_battle produced {arr.shape[0]} dims, expected {self._OBS_SIZE}"
         return np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # ---------- Typing one-hots ----------
-    def _type_one_hot_primary(self, t: PokemonType | None) -> List[float]:
-        vec = [0.0] * self._N_TYPE_PRIMARY
-        if t is None:
-            return vec
-        try:
-            name = str(t).split(".")[-1].upper()
-            if name in self._TYPE_ORDER:
-                vec[self._TYPE_ORDER.index(name)] = 1.0
-        except Exception:
-            pass
-        return vec
-
-    def _type_one_hot_secondary(self, t: PokemonType | None) -> List[float]:
-        vec = [0.0] * self._N_TYPE_SECONDARY
-        if t is None:
-            vec[-1] = 1.0
-            return vec
-        try:
-            name = str(t).split(".")[-1].upper()
-            if name in self._TYPE_ORDER:
-                vec[self._TYPE_ORDER.index(name)] = 1.0
-            else:
-                vec[-1] = 1.0
-        except Exception:
-            vec[-1] = 1.0
-        return vec
 
 
 ########################################
