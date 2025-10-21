@@ -20,78 +20,6 @@ from poke_env.battle.pokemon_type import PokemonType
 from showdown_gym.base_environment import BaseShowdownEnv
 
 
-# ---------- Expert chooser (logic mirrors your CustomAgent) ----------
-def _expert_best_move_idx(battle: AbstractBattle) -> int | None:
-    active: Pokemon | None = battle.active_pokemon
-    opp: Pokemon | None = battle.opponent_active_pokemon
-    if active is None or opp is None:
-        return 0 if battle.available_moves else None
-
-    moves: List[Move] = list(battle.available_moves or [])
-    if not moves:
-        return None
-
-    def move_score(m: Move) -> float:
-        base = _safe_base_power(m)
-        # STAB?
-        t = _safe_type(m)
-        stab = (
-            1.5
-            if (
-                t is not None
-                and any(
-                    (tt is not None and t == tt)
-                    for tt in (active.type_1, active.type_2)
-                )
-            )
-            else 1.0
-        )
-        # Effectiveness (vs opp types)
-        eff = _type_effectiveness(t, opp) if t is not None else 1.0
-        return base * stab * eff
-
-    best_i = 0
-    best_v = -1.0
-    for i, m in enumerate(moves[:4]):  # map to 6..9 later
-        v = move_score(m)
-        if v > best_v:
-            best_v = v
-            best_i = i
-    return best_i if best_v > 0.0 else None
-
-
-def _expert_best_switch_idx(battle: AbstractBattle) -> int | None:
-    opp: Pokemon | None = battle.opponent_active_pokemon
-    if opp is None:
-        return 0 if battle.available_switches else None
-
-    switches: List[Pokemon] = list(battle.available_switches or [])
-    if not switches:
-        return None
-
-    def matchup(mon: Pokemon) -> float:
-        my_types = [t for t in (mon.type_1, mon.type_2) if t]
-        opp_types = [t for t in (opp.type_1, opp.type_2) if t]
-        off = max((_type_effectiveness(t, opp) for t in my_types), default=1.0)
-        # "dff" in your code: max they deal to us (penalty)
-        dff = 1.0
-        if opp_types:
-            dff = max((_type_effectiveness(t, mon) for t in opp_types), default=1.0)
-        spd_bonus = (
-            0.1 if _safe_base_stat(mon, "spe") > _safe_base_stat(opp, "spe") else 0.0
-        )
-        return off - dff + spd_bonus
-
-    best_i = 0
-    best_v = -1e9
-    for i, mon in enumerate(switches):
-        v = matchup(mon)
-        if v > best_v:
-            best_v = v
-            best_i = i
-    return best_i
-
-
 # ---------- Safe helpers ----------
 def _safe_priority(m: Move) -> float:
     try:
@@ -158,13 +86,87 @@ def _type_effectiveness(mtype: PokemonType | None, target: Pokemon | None) -> fl
         return 1.0
 
 
+# ---------- Interpret SimpleHeuristicsPlayer orders ----------
+def _order_is_switch(order: Any) -> bool:
+    """Best-effort: is the expert order a switch? (portable across poke-env versions)."""
+    try:
+        if hasattr(order, "is_switch") and callable(order.is_switch):
+            return bool(order.is_switch())
+        if hasattr(order, "is_move") and callable(order.is_move):
+            return not bool(order.is_move())
+        if getattr(order, "switch", None) is not None:
+            return True
+        if getattr(order, "move", None) is not None:
+            return False
+        inner = getattr(order, "order", None)
+        if inner is not None:
+            if hasattr(inner, "base_power") or hasattr(inner, "id"):
+                return False
+            if hasattr(inner, "species") or hasattr(inner, "name"):
+                return True
+        s = str(order).lower()
+        if "switch" in s:
+            return True
+        if "move" in s:
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def _match_expert_action_index(
+    order: Any, moves: List[Move], switches: List[Pokemon]
+) -> int:
+    """
+    Map the expert's BattleOrder to our 0..9 discrete action.
+      0..5 = switch[i] (we only ever have up to 5 real switches; 5 is a spare slot)
+      6..9 = move[i] among the first 4 available moves
+    Fallbacks default to the first legal option of that type.
+    """
+    try:
+        if _order_is_switch(order):
+            # Try identity match first
+            chosen_sw = getattr(order, "switch", None) or getattr(
+                getattr(order, "order", None), "species", None
+            )
+            # Identity compare: object equality is OK in practice for available_switches
+            for i, s in enumerate(
+                switches[:6]
+            ):  # safe bound (we expose up to 6 switch slots: 0..5)
+                if s is not None and (
+                    s == chosen_sw
+                    or getattr(s, "species", None)
+                    == getattr(chosen_sw, "species", None)
+                ):
+                    return i  # 0..5
+            return (
+                0 if switches else 6
+            )  # fallback to a switch slot if any, else move slot as degenerate case
+        else:
+            chosen_mv = getattr(order, "move", None) or getattr(
+                getattr(order, "order", None), "id", None
+            )
+            for i, m in enumerate(moves[:4]):
+                if m is not None and (
+                    m == chosen_mv
+                    or getattr(m, "id", None) == getattr(chosen_mv, "id", None)
+                    or getattr(m, "id", None) == chosen_mv
+                ):
+                    return 6 + i  # 6..9
+            return 6 if moves else 0  # fallback: first move if any, else first switch
+    except Exception:
+        # Conservative default: choose first move slot (6) if possible
+        return 6 if moves else (0 if switches else 6)
+
+
 # ---------- Environment ----------
 class ShowdownEnvironment(BaseShowdownEnv):
     """
-    Level-1 Curriculum: Imitation.
+    Level-1 Curriculum: Imitation against SimpleHeuristicsPlayer.
       * Action space: 10 (0..5 switch, 6..9 move).
-      * Reward per step: 1 if agent's concrete action == expert's concrete action; else 0.
-      * Observation: 76-dim context (HP, per-move details, per-switch details, opponent typing).
+      * Phase A reward: action-level imitation (+1 match, -1 mismatch).
+      * Phase B reward: speed-weighted win-only.
+      * Observation: 76 dims (core HP, 4×move features, 5×switch features, opp typing one-hots).
     """
 
     # Opp typing one-hot sizes
@@ -193,9 +195,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     # Layout sizes
     _MOVE_BLOCK = 5  # [bp_norm, STAB, eff/4, acc, pr>0]
-    _N_MOVES = 4
+    _N_MOVES = 4  # maps to 6..9
     _SW_BLOCK = 3  # [bench_hp, bench_off_STAB_eff/4, speed_gt_opp]
-    _N_SWITCHES = 5
+    _N_SWITCHES = 5  # maps to 0..4 (we expose 0..5 actions; 5 is spare)
+
     _OBS_SIZE = (
         4
         + _N_MOVES * _MOVE_BLOCK
@@ -219,17 +222,15 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
         self.rl_agent = account_name_one
 
-        # Store last (agent_concrete, expert_concrete) selected at prior state
-        self._last_agent_action: int | None = None
-        self._last_expert_action: int | None = None
+        # Instantiate SimpleHeuristicsPlayer as the supervision "expert"
+        self._expert_player = SimpleHeuristicsPlayer(
+            battle_format=battle_format,
+            account_configuration=AccountConfiguration(account_name_two, None),
+        )
 
-        self.hp_bonus_weight = 0.25
-        self.gamma = 0.99
-
-        # curriculum schedule
-        self.global_step = 0
-        self.intent_imitation_steps = 20_000
-        self.win_time_decay = 0.03
+        # Minimal training state
+        self._last_agent_action: int | None = None  # 0..9 (what the policy chose)
+        self._last_expert_action: int | None = None  # 0..9 (what expert would do)
 
     # --------------------------
     # Action space: 10 actions
@@ -239,137 +240,51 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     def process_action(self, action: np.int64) -> np.int64:
         """
-        Map high-level action (0..9) to concrete Showdown action id.
-        Also compute and store expert's concrete action AND both intents (ATTACK vs SWITCH).
+        Map [0..5]=switch, [6..9]=move to *concrete* Showdown action.
+        Record the expert's matching 0..9 action using SimpleHeuristicsPlayer.
         """
+        b: AbstractBattle | None = self.battle1
         a = int(action)
-        assert 0 <= a <= 9, f"Action must be in [0,9], got {a}"
 
-        battle: AbstractBattle | None = self.battle1
-        if battle is None:
-            self._last_agent_action = None
-            self._last_expert_action = None
-            self._last_agent_intent = None
-            self._last_expert_intent = None
+        if b is None or not (0 <= a <= 9):
+            self._last_agent_action = self._last_expert_action = None
             return np.int64(-2)
 
-        moves = list(battle.available_moves or [])
-        switches = list(battle.available_switches or [])
+        moves: List[Move] = list(b.available_moves or [])
+        switches: List[Pokemon] = list(b.available_switches or [])
 
-        # Agent's requested intent from high-level action
-        agent_intent = "SWITCH" if (0 <= a <= 5) else "ATTACK"
-
-        # Agent concrete mapping with fallbacks
-        if agent_intent == "SWITCH":
-            if switches:
-                agent_concrete = a if a < len(switches) else 0
-            elif moves:
-                agent_concrete = 6  # fallback to first move
-                agent_intent = "ATTACK"
-            else:
-                agent_concrete = -2
-        else:  # ATTACK
-            move_idx = a - 6
+        # --- Agent mapping to concrete action with simple fallbacks ---
+        if a < 6:  # switch slot
+            concrete = a if switches else (6 if moves else -2)
+        else:  # move slot
+            mv_idx = a - 6
             if moves:
-                agent_concrete = 6 + (move_idx if move_idx < len(moves) else 0)
-            elif switches:
-                agent_concrete = 0  # fallback to first switch
-                agent_intent = "SWITCH"
+                concrete = 6 + (mv_idx if mv_idx < len(moves) else 0)
             else:
-                agent_concrete = -2
+                concrete = 0 if switches else -2
 
-        # Expert choice (reuse your expert logic)
-        m_idx = _expert_best_move_idx(battle)
-        if m_idx is not None:
-            expert_concrete = 6 + int(m_idx)
-            expert_intent = "ATTACK"
-        else:
-            s_idx = _expert_best_switch_idx(battle)
-            if s_idx is not None:
-                expert_concrete = int(s_idx)
-                expert_intent = "SWITCH"
-            else:
-                expert_concrete = -2
-                expert_intent = "SWITCH"  # arbitrary, no-ops default to non-attack
+        # --- Expert's discrete 0..9 action via heuristics ---
+        try:
+            order = self._expert_player.choose_move(b)
+            expert_action = _match_expert_action_index(order, moves, switches)
+        except Exception:
+            expert_action = 6 if moves else (0 if switches else 6)
 
-        # Persist for reward calculation
-        self._last_agent_action = agent_concrete
-        self._last_expert_action = expert_concrete
-        self._last_agent_intent = agent_intent
-        self._last_expert_intent = expert_intent
+        # Persist for reward
+        self._last_agent_action = a
+        self._last_expert_action = expert_action
 
-        return np.int64(agent_concrete)
+        return np.int64(concrete)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         """
-        Phase A (steps < intent_imitation_steps): intent-only imitation
-            r = 1.0 if agent_intent == expert_intent else 0.0
-        Phase B (afterwards): speed-weighted win-only
-            r = exp(-win_time_decay * T) if win else 0.0
+        Phase A: action-level imitation
+            r = +1.0 if agent_action == expert_action else -1.0
         """
-        # ---------- Phase A: intent imitation ----------
-        if self.global_step < self.intent_imitation_steps:
-            if (
-                getattr(self, "_last_agent_intent", None) is None
-                or getattr(self, "_last_expert_intent", None) is None
-            ):
-                r = 0.0
-            else:
-                r = (
-                    1.0
-                    if (self._last_agent_intent == self._last_expert_intent)
-                    else 0.0
-                )
+        ra, re = self._last_agent_action, self._last_expert_action
+        r = 1.0 if (ra is not None and re is not None and ra == re) else -1.0
 
-        # ---------- Phase B: speed-weighted win-only ----------
-        else:
-            if battle.finished and battle.won:
-                # battle.turn is 1-based; treat missing/zero as 1
-                T = int(getattr(battle, "turn", 1) or 1)
-                r = float(np.exp(-float(self.win_time_decay) * float(T)))
-            else:
-                r = 0.0
-
-        self.global_step += 1
-        return float(r)
-
-    def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
-        info = super().get_additional_info()
-        if self.battle1 is not None:
-            agent = self.possible_agents[0]
-            b = self.battle1
-            team_hp = (
-                float(np.sum([m.current_hp_fraction for m in b.team.values()])) / 6.0
-            )
-            opp_hp = (
-                float(np.sum([m.current_hp_fraction for m in b.opponent_team.values()]))
-                / 6.0
-            )
-            fainted_self = int(np.sum([int(m.fainted) for m in b.team.values()]))
-            fainted_opp = int(
-                np.sum([int(m.fainted) for m in b.opponent_team.values()])
-            )
-
-            info[agent]["win"] = b.won
-            info[agent]["team_hp"] = team_hp
-            info[agent]["opp_hp"] = opp_hp
-            info[agent]["fainted_self"] = fainted_self
-            info[agent]["fainted_opp"] = fainted_opp
-            info[agent]["phase"] = (
-                "intent_imitation"
-                if self.global_step < self.intent_imitation_steps
-                else "win_only"
-            )
-
-            if (
-                getattr(self, "_last_agent_intent", None) is not None
-                and getattr(self, "_last_expert_intent", None) is not None
-            ):
-                info[agent]["intent_match"] = int(
-                    self._last_agent_intent == self._last_expert_intent
-                )
-
-        return info
+        return r
 
     # --------------------------
     # Observation / Embedding
@@ -388,6 +303,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
             5 × [ bench_hp, bench_off_STAB_eff/4, speed_gt_opp ]
           Opp typing 37:
             [ primary_type_onehot(18), secondary_type_onehot(19 with NONE) ]
+
+        This gives the policy everything needed to pick among actions 0..9:
+          - For 6..9 (moves): per-move power, accuracy, priority, STAB, effectiveness.
+          - For 0..5 (switches): bench HP, offensive effectiveness vs opp, speed edge.
         """
         me: Pokemon | None = battle.active_pokemon
         opp: Pokemon | None = battle.opponent_active_pokemon
@@ -415,10 +334,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         vec: List[float] = [my_hp, opp_hp, my_team_total, opp_team_total]
 
-        # ---- Moves (pad to 4) ----
-        moves: List[Move] = list(battle.available_moves or [])[: self._N_MOVES]
+        # ---- Moves (pad to exactly 4) ----
+        moves: List[Move | None] = list(battle.available_moves or [])[: self._N_MOVES]
         while len(moves) < self._N_MOVES:
-            moves.append(None)  # type: ignore
+            moves.append(None)
 
         for m in moves:
             if m is None:
@@ -452,7 +371,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 ), f"move feature {name} out of [0,1]: {val}"
             vec += [bp_norm, stab, eff_norm, acc, pr]
 
-        # ---- Switches (pad to 5) ----
+        # ---- Switches (pad to exactly 5) ----
         bench: List[Pokemon | None] = list(battle.available_switches or [])[
             : self._N_SWITCHES
         ]
@@ -472,9 +391,11 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 for t in (getattr(bm, "type_1", None), getattr(bm, "type_2", None))
                 if t
             ]
-            eff_off = 1.0
-            if types:
-                eff_off = max((_type_effectiveness(t, opp) for t in types), default=1.0)
+            eff_off = (
+                max((_type_effectiveness(t, opp) for t in types), default=1.0)
+                if types
+                else 1.0
+            )
             eff_off_norm = float(np.clip(eff_off / 4.0, 0.0, 1.0))
             spd_gt = 1.0 if _safe_base_stat(bm, "spe") > opp_spe else 0.0
             for name, val in (
