@@ -223,6 +223,17 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self._last_agent_action: int | None = None
         self._last_expert_action: int | None = None
 
+        self.hp_bonus_weight = 0.25
+        self.gamma = 0.99
+
+        # curriculum schedule
+        self.global_step = 200000
+        self.imitation_phase_steps = 20_000  # <- pure imitation length
+        self.imitation_w0 = 0.5  # starting weight for imitation in blended phase
+        self.imitation_decay_steps = (
+            150_000  # decay to 0 over this many steps after the phase
+        )
+
     # --------------------------
     # Action space: 10 actions
     # --------------------------
@@ -282,21 +293,77 @@ class ShowdownEnvironment(BaseShowdownEnv):
     # --------------------------
     # Imitation reward (per step)
     # --------------------------
+
+    def _imitation_weight(self) -> float:
+        """
+        Cosine decay from imitation_w0 -> 0 over imitation_decay_steps.
+        Only used AFTER the pure-imitation phase.
+        """
+        if self.global_step < self.imitation_phase_steps:
+            return 0.0
+        t = (self.global_step - self.imitation_phase_steps) / max(
+            1, self.imitation_decay_steps
+        )
+        t = float(np.clip(t, 0.0, 1.0))
+        # cosine 1..0 -> multiply by initial weight
+        return self.imitation_w0 * 0.5 * (1.0 + np.cos(np.pi * t))
+
+    def _phi(self, b: AbstractBattle | None) -> float:
+        if b is None:
+            return 0.0
+        our_hp = float(np.sum([m.current_hp_fraction for m in b.team.values()])) / 6.0
+        opp_hp = (
+            float(np.sum([m.current_hp_fraction for m in b.opponent_team.values()]))
+            / 6.0
+        )
+        our_f = int(np.sum([int(m.fainted) for m in b.team.values()])) / 6.0
+        opp_f = int(np.sum([int(m.fainted) for m in b.opponent_team.values()])) / 6.0
+        team_adv = float(np.clip(our_hp - opp_hp, -1.0, 1.0))
+        faint_adv = float(np.clip(opp_f - our_f, -1.0, 1.0))
+        return float(np.clip(0.7 * team_adv + 0.3 * faint_adv, -1.0, 1.0))
+
+    # --- replace your calc_reward with this ---
     def calc_reward(self, battle: AbstractBattle) -> float:
         """
-        Reward the agent if its concrete action last step matched the expert's concrete action.
+        Phase 1 (steps < imitation_phase_steps): pure imitation (dense).
+        Phase 2: blended (terminal + potential shaping + decaying imitation).
         """
-        if self._last_agent_action is None or self._last_expert_action is None:
-            return 0.0
-        return (
-            1.0
-            if int(self._last_agent_action) == int(self._last_expert_action)
-            else 0.0
-        )
+        # imitation match (uses last concrete actions you already store)
+        imit = 0.0
+        if self._last_agent_action is not None and self._last_expert_action is not None:
+            imit = (
+                1.0
+                if int(self._last_agent_action) == int(self._last_expert_action)
+                else 0.0
+            )
 
-    # --------------------------
-    # Additional info
-    # --------------------------
+        # terminal part (+ small HP margin)
+        terminal = 0.0
+        if battle.finished:
+            terminal = 1.0 if battle.won else 0.0
+            team_hp_total = (
+                float(np.sum([m.current_hp_fraction for m in battle.team.values()]))
+                / 6.0
+            )
+            terminal += self.hp_bonus_weight * float(np.clip(team_hp_total, 0.0, 1.0))
+
+        # potential-based shaping (safe): γΦ(s') − Φ(s), lightly clipped
+        prior = self._get_prior_battle(battle)
+        dphi = 0.0
+        if prior is not None:
+            dphi = self.gamma * self._phi(battle) - self._phi(prior)
+            dphi = float(np.clip(dphi, -0.25, 0.25))
+
+        # schedule
+        if self.global_step < self.imitation_phase_steps:
+            reward = imit  # pure imitation
+        else:
+            reward = terminal + dphi + self._imitation_weight() * imit
+
+        self.global_step += 1
+        return float(reward)
+
+    # --- optional: surface the phase & imitation weight in your logs ---
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
         if self.battle1 is not None:
@@ -318,7 +385,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
             info[agent]["opp_hp"] = opp_hp
             info[agent]["fainted_self"] = fainted_self
             info[agent]["fainted_opp"] = fainted_opp
-            # Optional: imitation flag for the last step
+            info[agent]["phase"] = (
+                "imitation"
+                if self.global_step < self.imitation_phase_steps
+                else "blended"
+            )
+            info[agent]["imit_w"] = self._imitation_weight()
             if (
                 self._last_agent_action is not None
                 and self._last_expert_action is not None
