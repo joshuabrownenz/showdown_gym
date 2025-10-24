@@ -200,27 +200,6 @@ def _is_move_physical(m: Move) -> float:
         return 0.0
 
 
-def _is_self_boost_setup_move(m: Move, active: Pokemon | None) -> float:
-    """Heuristic mirrors SHP: target == 'self' and boosts sum >= 2 and not already at +6."""
-    try:
-        if getattr(m, "target", None) != "self":
-            return 0.0
-        boosts = getattr(m, "boosts", None)
-        if not boosts:
-            return 0.0
-        if sum(v for v in boosts.values() if isinstance(v, (int, float))) < 2:
-            return 0.0
-        if active is None:
-            return 1.0
-        # not already at +6 for any boosted stat
-        for s, v in boosts.items():
-            if v > 0 and _safe_boost(active, s) >= 6:
-                return 0.0
-        return 1.0
-    except Exception:
-        return 0.0
-
-
 def _type_effectiveness(mtype: PokemonType | None, target: Pokemon | None) -> float:
     try:
         if mtype is None or target is None:
@@ -267,38 +246,6 @@ def _opp_damage_to_mon_max(opp: Pokemon | None, mon: Pokemon | None) -> float:
         return 1.0
 
 
-# Hazards (include both correct and the typo variant found in the provided SHP code)
-_ENTRY_HAZARDS_IDS = {"spikes", "stealhrock", "stickyweb", "toxicspikes"}
-_ANTI_HAZARDS_IDS = {"rapidspin", "defog"}
-
-
-def _is_entry_hazard_move(m: Move) -> float:
-    try:
-        return 1.0 if getattr(m, "id", "") in _ENTRY_HAZARDS_IDS else 0.0
-    except Exception:
-        return 0.0
-
-
-def _is_anti_hazard_move(m: Move) -> float:
-    try:
-        return 1.0 if getattr(m, "id", "") in _ANTI_HAZARDS_IDS else 0.0
-    except Exception:
-        return 0.0
-
-
-def _has_condition(side_conditions: Dict[Any, Any], needle: str) -> float:
-    """Robustly detect a condition by name from SideCondition keys."""
-    try:
-        ndl = needle.lower()
-        for k in side_conditions.keys():
-            s = str(k).lower()
-            if ndl in s:
-                return 1.0
-        return 0.0
-    except Exception:
-        return 0.0
-
-
 # =============== Expert order interpretation ===============
 def _order_is_switch(order: Any) -> bool:
     try:
@@ -326,36 +273,79 @@ def _order_is_switch(order: Any) -> bool:
     return False
 
 
-def _match_expert_action_index(
-    order: Any, moves: List[Move], switches: List[Pokemon]
-) -> int:
-    try:
-        if _order_is_switch(order):
-            chosen_sw = getattr(order, "switch", None) or getattr(
-                getattr(order, "order", None), "species", None
-            )
-            for i, s in enumerate(switches[:6]):
-                if s is not None and (
-                    s == chosen_sw
-                    or getattr(s, "species", None)
-                    == getattr(chosen_sw, "species", None)
-                ):
-                    return i
-            return 0 if switches else 6
-        else:
-            chosen_mv = getattr(order, "move", None) or getattr(
-                getattr(order, "order", None), "id", None
-            )
-            for i, m in enumerate(moves[:4]):
-                if m is not None and (
-                    m == chosen_mv
-                    or getattr(m, "id", None) == getattr(chosen_mv, "id", None)
-                    or getattr(m, "id", None) == chosen_mv
-                ):
-                    return 6 + i
-            return 6 if moves else 0
-    except Exception:
-        return 6 if moves else (0 if switches else 6)
+def _shp_best_move_idx(battle: AbstractBattle) -> int | None:
+    """Replicates SHP's move scoring to pick the best available move index [0..3]."""
+    active: Pokemon | None = battle.active_pokemon
+    opponent: Pokemon | None = battle.opponent_active_pokemon
+    if active is None or opponent is None:
+        return None
+    moves: List[Move] = list(battle.available_moves or [])
+    if not moves:
+        return None
+
+    # SHP's damage ratios
+    def _stat_est(mon: Pokemon, stat: str) -> float:
+        boost = (
+            (2 + mon.boosts[stat]) / 2
+            if mon.boosts[stat] > 1
+            else 2 / (2 - mon.boosts[stat])
+        )
+        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
+
+    physical_ratio = _stat_est(active, "atk") / _stat_est(opponent, "def")
+    special_ratio = _stat_est(active, "spa") / _stat_est(opponent, "spd")
+
+    def score(m: Move) -> float:
+        bp = _safe_base_power(m)
+        stab = 1.5 if (_safe_type(m) in (active.type_1, active.type_2)) else 1.0
+        ratio = physical_ratio if _is_move_physical(m) > 0.5 else special_ratio
+        acc = _safe_accuracy(m)
+        hits = _safe_expected_hits(m)
+        eff = (
+            opponent.damage_multiplier(m)
+            if hasattr(opponent, "damage_multiplier")
+            else 1.0
+        )
+        return bp * stab * ratio * acc * hits * eff
+
+    best_i, best_v = 0, -1.0
+    for i, m in enumerate(moves[:4]):
+        v = score(m)
+        if v > best_v:
+            best_i, best_v = i, v
+    return best_i
+
+
+def _shp_best_switch_idx(battle: AbstractBattle) -> int | None:
+    """Replicates SHP's switch scoring to pick the best available switch index [0..5]."""
+    opponent: Pokemon | None = battle.opponent_active_pokemon
+    if opponent is None:
+        return None
+    switches: List[Pokemon] = list(battle.available_switches or [])
+    if not switches:
+        return None
+
+    def estimate_matchup(mon: Pokemon, opp: Pokemon) -> float:
+        # same as your ModifiedSimpleHeuristicsPlayer._estimate_matchup
+        speed_coef = ModifiedSimpleHeuristicsPlayer.SPEED_TIER_COEFICIENT
+        hp_coef = ModifiedSimpleHeuristicsPlayer.HP_FRACTION_COEFICIENT
+        score = max(
+            [opp.damage_multiplier(t) for t in mon.types if t is not None]
+        ) - max([mon.damage_multiplier(t) for t in opp.types if t is not None])
+        if mon.base_stats["spe"] > opp.base_stats["spe"]:
+            score += speed_coef
+        elif opp.base_stats["spe"] > mon.base_stats["spe"]:
+            score -= speed_coef
+        score += mon.current_hp_fraction * hp_coef
+        score -= opp.current_hp_fraction * hp_coef
+        return float(score)
+
+    best_i, best_v = 0, -1e9
+    for i, s in enumerate(switches[:6]):
+        v = estimate_matchup(s, opponent)
+        if v > best_v:
+            best_i, best_v = i, v
+    return best_i
 
 
 # =============== Environment ===============
@@ -423,46 +413,82 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     # ---------- Action space ----------
     def _get_action_size(self) -> int | None:
-        return 10
+        return 2
+
+    def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
+        info = super().get_additional_info()
+        if self.battle1 is not None:
+            agent = self.possible_agents[0]
+            b = self.battle1
+
+            info[agent]["win"] = b.won
+            info[agent]["intent_agent"] = getattr(self, "_last_agent_intent", None)
+            info[agent]["intent_expert"] = getattr(self, "_last_expert_intent", None)
+            info[agent]["intent_match"] = (
+                int(info[agent]["intent_agent"] == info[agent]["intent_expert"])
+                if (info[agent]["intent_agent"] and info[agent]["intent_expert"])
+                else 0
+            )
+
+        return info
 
     def process_action(self, action: np.int64) -> np.int64:
-        """Map 0..5 switches / 6..9 moves to concrete order; also record SHP's matching 0..9 action."""
+        """
+        Action 0 -> ATTACK: execute SHP's best move.
+        Action 1 -> SWITCH: execute SHP's best switch.
+        Reward compares agent intent vs SHP intent (move vs switch) on this state.
+        """
         b: AbstractBattle | None = self.battle1
         a = int(action)
+        assert a in (0, 1), f"Action must be 0 (ATTACK) or 1 (SWITCH), got {a}"
 
-        if b is None or not (0 <= a <= 9):
-            self._last_agent_action = self._last_expert_action = None
-            return np.int64(-2)
+        if b is None:
+            self._last_agent_intent = None
+            self._last_expert_intent = None
+            return np.int64(-2)  # Default if no battle
 
         moves: List[Move] = list(b.available_moves or [])
         switches: List[Pokemon] = list(b.available_switches or [])
 
-        # Agent mapping
-        if a < 6:  # switch slot
-            concrete = a if switches else (6 if moves else -2)
-        else:  # move slot
-            mv_idx = a - 6
-            if moves:
-                concrete = 6 + (mv_idx if mv_idx < len(moves) else 0)
+        # --- Expert intent from SHP's actual decision on this state ---
+        expert_order = self._expert_player.choose_move(b)
+        expert_is_switch = _order_is_switch(expert_order)
+        self._last_expert_intent = "SWITCH" if expert_is_switch else "ATTACK"
+
+        # --- Agent intent from action ---
+        self._last_agent_intent = "ATTACK" if a == 0 else "SWITCH"
+
+        # --- Build the concrete action to execute based on the agent's intent ---
+        mv_idx = _shp_best_move_idx(b)
+        sw_idx = _shp_best_switch_idx(b)
+
+        if self._last_agent_intent == "ATTACK":
+            if mv_idx is not None and moves:
+                concrete = 6 + int(mv_idx)  # move slot
+            elif sw_idx is not None and switches:
+                concrete = int(sw_idx)  # fallback to switch
             else:
-                concrete = 0 if switches else -2
+                concrete = -2  # no-ops
+        else:  # SWITCH
+            if sw_idx is not None and switches:
+                concrete = int(sw_idx)  # switch slot
+            elif mv_idx is not None and moves:
+                concrete = 6 + int(mv_idx)  # fallback to move
+            else:
+                concrete = -2
 
-        # Expert mapping
-        try:
-            order = self._expert_player.choose_move(b)
-            expert_action = _match_expert_action_index(order, moves, switches)
-        except Exception:
-            expert_action = 6 if moves else (0 if switches else 6)
+        # Invariants (helpful during dev)
+        assert self._last_agent_intent in ("ATTACK", "SWITCH")
+        assert self._last_expert_intent in ("ATTACK", "SWITCH")
 
-        self._last_agent_action = a
-        self._last_expert_action = expert_action
         return np.int64(concrete)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """+1/-1 action-level imitation in phase A; win-only (time-decayed) afterward."""
-        ra, re = self._last_agent_action, self._last_expert_action
-        r = 1.0 if (ra is not None and re is not None and ra == re) else -1.0
-        return r
+        ai = getattr(self, "_last_agent_intent", None)
+        ei = getattr(self, "_last_expert_intent", None)
+        if ai is None or ei is None:
+            return 0.0
+        return 1.0 if ai == ei else -1.0
 
     # ---------- Observation / Embedding ----------
     def _observation_size(self) -> int:
