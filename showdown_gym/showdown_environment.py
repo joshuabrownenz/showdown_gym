@@ -421,6 +421,22 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self._last_agent_action: int | None = None  # 0..9 chosen by policy
         self._last_expert_action: int | None = None  # 0..9 chosen by SHP
 
+        self._ep_total_intents: int = (
+            0  # how many intent labels we produced this episode
+        )
+        self._ep_match_intents: int = 0  # how many times agent intent == expert intent
+        self._ep_last_turn: int = 0
+
+    def _reset_episode_counters(self) -> None:
+        self._ep_total_intents = 0
+        self._ep_match_intents = 0
+        self._ep_last_turn = 0
+
+    def reset(self, seed=None, options=None):
+        response = super().reset(seed=seed, options=options)
+        self._reset_episode_counters()
+        return response
+
     # ---------- Action space ----------
     def _get_action_size(self) -> int | None:
         return 10
@@ -456,6 +472,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         self._last_agent_action = a
         self._last_expert_action = expert_action
+
+        if (
+            getattr(self, "_last_agent_action", None) is not None
+            and getattr(self, "_last_expert_action", None) is not None
+        ):
+            self._ep_total_intents += 1
+            if self._last_agent_action == self._last_expert_action:
+                self._ep_match_intents += 1
+
+        # Track last seen turn (helpful for mean turns / win)
+        try:
+            if self.battle1 is not None:
+                t = int(getattr(self.battle1, "turn", 0) or 0)
+                if t > self._ep_last_turn:
+                    self._ep_last_turn = t
+        except Exception:
+            pass
+
         return np.int64(concrete)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
@@ -467,6 +501,55 @@ class ShowdownEnvironment(BaseShowdownEnv):
     # ---------- Observation / Embedding ----------
     def _observation_size(self) -> int:
         return self._OBS_SIZE
+
+    def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
+        info = super().get_additional_info()
+        if self.battle1 is not None:
+            agent = self.possible_agents[0]
+            b = self.battle1
+
+            # Existing basics
+            team_hp = (
+                float(np.sum([m.current_hp_fraction for m in b.team.values()])) / 6.0
+            )
+            opp_hp = (
+                float(np.sum([m.current_hp_fraction for m in b.opponent_team.values()]))
+                / 6.0
+            )
+            fainted_self = int(np.sum([int(m.fainted) for m in b.team.values()]))
+            fainted_opp = int(
+                np.sum([int(m.fainted) for m in b.opponent_team.values()])
+            )
+            info[agent]["win"] = b.won
+            info[agent]["team_hp"] = team_hp
+            info[agent]["opp_hp"] = opp_hp
+            info[agent]["fainted_self"] = fainted_self
+            info[agent]["fainted_opp"] = fainted_opp
+
+            # Intents on the last decision (for debugging)
+            info[agent]["intent_agent"] = getattr(self, "_last_agent_action", None)
+            info[agent]["intent_expert"] = getattr(self, "_last_expert_action", None)
+            info[agent]["intent_match"] = int(
+                (getattr(self, "_last_agent_action", None) is not None)
+                and (getattr(self, "_last_expert_action", None) is not None)
+                and (self._last_agent_action == self._last_expert_action)
+            )
+
+            # --- Episode aggregates (what you’ll use in post-processing) ---
+            info[agent]["ep_intent_total"] = int(self._ep_total_intents)
+            info[agent]["ep_intent_matches"] = int(self._ep_match_intents)
+            info[agent]["ep_imitation_accuracy"] = (
+                float(self._ep_match_intents) / float(self._ep_total_intents)
+                if self._ep_total_intents > 0
+                else 0.0
+            )
+            # turns for this episode (battle.turn tends to be 1-based; we just emit last seen)
+            info[agent]["ep_turns"] = int(self._ep_last_turn)
+
+            # Optional: mark opponent you evaluated against if you know it externally
+            # info[agent]["opponent"] = "MaxBasePower"  # uncomment if you run that eval
+
+        return info
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
