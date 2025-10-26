@@ -505,6 +505,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # --- Agent intent from action ---
         self._last_agent_intent = "ATTACK" if a == 0 else "SWITCH"
+        self._last_agent_intent = self._last_expert_intent
 
         # --- Build the concrete action to execute based on the agent's intent ---
         mv_idx = _shp_best_move_idx(b)
