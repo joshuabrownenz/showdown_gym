@@ -505,7 +505,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # --- Agent intent from action ---
         self._last_agent_intent = "ATTACK" if a == 0 else "SWITCH"
-        self._last_agent_intent = self._last_expert_intent
 
         # --- Build the concrete action to execute based on the agent's intent ---
         mv_idx = _shp_best_move_idx(b)
@@ -582,10 +581,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         my_hp = float(getattr(me, "current_hp_fraction", 0.0) or 0.0) if me else 0.0
         opp_hp = float(getattr(opp, "current_hp_fraction", 0.0) or 0.0) if opp else 0.0
 
-        boosts_atk = _safe_boost(me, "atk") / 6.0
-        boosts_def = _safe_boost(me, "def") / 6.0
-        boosts_spa = _safe_boost(me, "spa") / 6.0
-        boosts_spd = _safe_boost(me, "spd") / 6.0
+        boosts_atk = (_safe_boost(me, "atk") + 6) / 12.0
+        boosts_def = (_safe_boost(me, "def") + 6) / 12.0
+        boosts_spa = (_safe_boost(me, "spa") + 6) / 12.0
+        boosts_spd = (_safe_boost(me, "spd") + 6) / 12.0
 
         base_atk = _safe_base_stat(me, "atk") / 255.0
         base_def = _safe_base_stat(me, "def") / 255.0
