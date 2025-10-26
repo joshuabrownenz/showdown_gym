@@ -572,10 +572,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         my_hp = float(getattr(me, "current_hp_fraction", 0.0) or 0.0) if me else 0.0
         opp_hp = float(getattr(opp, "current_hp_fraction", 0.0) or 0.0) if opp else 0.0
 
-        boosts_atk = _safe_boost(me, "atk") / 6.0
-        boosts_def = _safe_boost(me, "def") / 6.0
-        boosts_spa = _safe_boost(me, "spa") / 6.0
-        boosts_spd = _safe_boost(me, "spd") / 6.0
+        boosts_atk = (_safe_boost(me, "atk") + 6) / 12.0
+        boosts_def = (_safe_boost(me, "def") + 6) / 12.0
+        boosts_spa = (_safe_boost(me, "spa") + 6) / 12.0
+        boosts_spd = (_safe_boost(me, "spd") + 6) / 12.0
 
         base_atk = _safe_base_stat(me, "atk") / 255.0
         base_def = _safe_base_stat(me, "def") / 255.0
